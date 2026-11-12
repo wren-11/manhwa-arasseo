@@ -1,0 +1,17 @@
+{
+  "name": {
+    "message": "Manhwa Arasseo!"
+  },
+  "description": {
+    "message": "截图识别韩漫对话框，用通义千问或 Claude 翻译，把译文直接盖在韩文原文上。"
+  },
+  "actionTitle": {
+    "message": "翻译当前画面（Mac：Option+K，Windows：Alt+K）"
+  },
+  "commandTranslate": {
+    "message": "翻译当前画面"
+  },
+  "commandPrefetch": {
+    "message": "预翻译整话（条漫）"
+  }
+}

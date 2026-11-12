@@ -1,0 +1,17 @@
+{
+  "name": {
+    "message": "Manhwa Arasseo!"
+  },
+  "description": {
+    "message": "Screenshots the manhwa you're reading, finds the speech bubbles with Qwen or Claude, and lays translations over the original Korean text."
+  },
+  "actionTitle": {
+    "message": "Translate this screen (Option+K on Mac, Alt+K on Windows)"
+  },
+  "commandTranslate": {
+    "message": "Translate this screen"
+  },
+  "commandPrefetch": {
+    "message": "Pre-translate the whole episode (webtoons)"
+  }
+}

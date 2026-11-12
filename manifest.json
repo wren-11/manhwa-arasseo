@@ -1,0 +1,44 @@
+{
+  "manifest_version": 3,
+  "name": "__MSG_name__",
+  "version": "0.1.0",
+  "description": "__MSG_description__",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage",
+    "tabCapture",
+    "offscreen"
+  ],
+  "host_permissions": [
+    "https://api.anthropic.com/*",
+    "https://dashscope.aliyuncs.com/*",
+    "https://*.maas.aliyuncs.com/*",
+    "https://dashscope-intl.aliyuncs.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "__MSG_actionTitle__"
+  },
+  "commands": {
+    "translate": {
+      "suggested_key": {
+        "default": "Alt+K",
+        "mac": "Alt+K"
+      },
+      "description": "__MSG_commandTranslate__"
+    },
+    "prefetch": {
+      "suggested_key": {
+        "default": "Alt+Shift+K",
+        "mac": "Alt+Shift+K"
+      },
+      "description": "__MSG_commandPrefetch__"
+    }
+  },
+  "options_page": "options.html",
+  "default_locale": "en"
+}
