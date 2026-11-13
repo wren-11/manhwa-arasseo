@@ -373,6 +373,11 @@ async function stopRecorder() {
 // 已经翻过的段会跳过；限速或出错没翻成的段留着，之后正常往下看时会自动补上
 const PREFETCH_PAR = 4;
 
+// 换哪一段都会一样失败的错误（key 不对、欠费、额度用完、今天的次数用完）才停下整轮
+const FATAL_CODES = new Set(["Arrearage", "AccessDenied", "Model.AccessDenied", "insufficient_quota"]);
+const fatalError = (e) =>
+  [401, 402, 403].includes(e.status) || (e.status === 429 && e.daily) || FATAL_CODES.has(e.code) || /credit balance|余额|欠费|额度/i.test(e.message);
+
 function stopPrefetch(tabId) {
   const job = stripState.get(tabId)?.prefetch;
   if (job) job.stop = true;
@@ -384,6 +389,7 @@ async function togglePrefetch(tab, g, conf) {
   if (st.prefetch) return console.debug("[预翻译] 又按了一次，停止"), stopPrefetch(tab.id); // 再按一次就停
   const job = { stop: false, error: null };
   st.prefetch = job;
+  st.latestJob = job; // 按钮只显示最新这一轮的进度
   const origin = g.scrollTop; // 扫完回到这里
   st.userTop = origin;
   const H0 = g.rect.bottom - g.rect.top;
@@ -394,8 +400,9 @@ async function togglePrefetch(tab, g, conf) {
   let stoppedByUser = false;
   let fast = false;
   // 截完之后又开了新的一轮：旧的这轮只管在后台翻完，不再改按钮
+  // 又开了新的一轮：旧的这轮只管在后台翻完，不再改按钮（不然两轮的进度会来回跳）
   const status = () =>
-    (!st.prefetch || st.prefetch === job) &&
+    st.latestJob === job &&
     send(tab.id, { type: "prefetchState", state: phase, pct: scanPct, done, total, stopped: stoppedByUser, fast });
 
   // 翻译队列：先翻用户正在看的位置往下最近的那段，翻译走在用户前面
@@ -433,8 +440,14 @@ async function togglePrefetch(tab, g, conf) {
             pause = Date.now() + 20_000;
             task.retried = true;
             queue.push(task);
-          } else if (e.name !== "AbortError") job.error ||= e;
-          else done++;
+          } else if (e.name === "AbortError") done++;
+          else if (fatalError(e)) job.error ||= e;
+          else {
+            // 只是这一段出错（内容审核没过、超时、服务器一时出错）：跳过这段接着翻别的，不让整轮停下。
+            // 这段没记成翻过，之后看到这里时边看边翻会再试一次
+            done++;
+            console.debug(`[预翻译] 段 ${Math.round(task.band?.[0] ?? 0)}–${Math.round(task.band?.[1] ?? 0)} 没翻成，跳过：`, e.message);
+          }
         } finally {
           active--;
           st.inflight--;
@@ -506,7 +519,21 @@ async function togglePrefetch(tab, g, conf) {
         queue.push(translate);
         pump();
       }
-      if (now.scrollTop + H >= now.scrollHeight - 2) break; // 到底了
+      if (now.scrollTop + H >= now.scrollHeight - 2) {
+        // 看起来到底了。很长的一话，网站常常滑到底附近才接着加载后面的部分（页面会变长）：
+        // 等一会儿，变长了就接着往下扫，确定不再变长才算真的到底
+        let grew = false;
+        for (let t = 0; t < 10 && !job.stop; t++) {
+          await sleep(250);
+          const v = await ask(tab.id, { type: "geom" });
+          if (v?.strip && v.scrollHeight > now.scrollHeight + 20) {
+            grew = true;
+            break;
+          }
+        }
+        if (!grew) break; // 真的到底了
+        console.debug("[预翻译] 页面变长了（网站接着加载了后面的部分），继续往下扫");
+      }
       // 往下跳多少：按这一屏真正看得到的部分（去掉上面工具栏、下面按钮挡住的），再往回留 35% 屏高。
       // 被下边切开的对话框在下一屏要能整个露出来：重叠太少（以前 15%）的话，高一点的对话框两屏都只看到一半，就漏了。
       // 录制取画面很快，多扫几屏花不了多少时间；重叠部分画出的重复框会自动去掉
@@ -535,6 +562,220 @@ async function togglePrefetch(tab, g, conf) {
     phase = job.error ? "idle" : !returnToOrigin ? "stopped" : "done";
     status();
     if (job.error) await send(tab.id, { type: "error", text: job.error.message });
+  }
+}
+
+// ---------- 用截图校正模型给的框 ----------
+// 模型（尤其千问）给的位置常常偏一点、大一点，或者把一个对话框按行拆成几条。
+// 在模型的框附近找真正的白色对话框（或白底）和里面的字，把框挪到字上、缩到字的大小。
+// 找不到可靠的白底（深色对话框、字直接写在画上）就原样用模型的框。
+async function makeRefiner(dataUrl) {
+  const bmp = await createImageBitmap(await (await fetch(dataUrl)).blob());
+  const S = Math.min(1, 1000 / bmp.width);
+  const W = Math.max(1, Math.round(bmp.width * S));
+  const H = Math.max(1, Math.round(bmp.height * S));
+  const ctx = new OffscreenCanvas(W, H).getContext("2d", { willReadFrequently: true });
+  ctx.drawImage(bmp, 0, 0, W, H);
+  const px = ctx.getImageData(0, 0, W, H).data;
+  const gray = new Uint8Array(W * H);
+  for (let i = 0; i < gray.length; i++) gray[i] = (px[i * 4] * 3 + px[i * 4 + 1] * 6 + px[i * 4 + 2]) / 10;
+  const LIGHT = 238; // 对话框、白底都接近纯白；浅色的天空、背景不算
+  const INK = 170; // 比这深的才算字的笔画
+  let cur = null;
+  const dbg = (m) => console.debug("[校正] 用模型原来的框：" + m + " 框=" + cur);
+
+  // 先在框附近找；找不到封闭的对话框（可能被窗口切到了）就看大一点再找，最后才退回"白底上的字"
+  return (box) => {
+    cur = box.map(Math.round).join(",") + ` 图 ${W}×${H}`;
+    for (const k of [0.6, 1.2, 2]) {
+      const r = attempt(box, k, false);
+      if (r) return r;
+    }
+    return attempt(box, 0.6, true);
+  };
+
+  function attempt(box, k, allowOpen) {
+    const say = (m) => allowOpen && dbg(m);
+    const [ymin, xmin, ymax, xmax] = box;
+    const bx0 = (xmin / 1000) * W, bx1 = (xmax / 1000) * W, by0 = (ymin / 1000) * H, by1 = (ymax / 1000) * H;
+    const bw = bx1 - bx0, bh = by1 - by0;
+    if (bw < 3 || bh < 3) return null;
+    // 在模型的框四周多看一圈（按框的长边算）：框偏了、或者只是对话框里的一行，也能看到整个对话框
+    const e = Math.max(24, Math.max(bw, bh) * k);
+    const wx0 = Math.max(0, Math.floor(bx0 - e)), wx1 = Math.min(W, Math.ceil(bx1 + e));
+    const wy0 = Math.max(0, Math.floor(by0 - e)), wy1 = Math.min(H, Math.ceil(by1 + e));
+    const ww = wx1 - wx0, wh = wy1 - wy0;
+    if (ww < 8 || wh < 8) return null;
+    const at = (x, y) => gray[(wy0 + y) * W + wx0 + x];
+    const light = (x, y) => at(x, y) >= LIGHT;
+    // 周围 5×5 都是白的点才能当起点（避开字缝里、画里零星的亮点）
+    const solid = (x, y) => {
+      if (x < 2 || y < 2 || x >= ww - 2 || y >= wh - 2) return false;
+      for (let j = -2; j <= 2; j++) for (let i = -2; i <= 2; i++) if (!light(x + i, y + j)) return false;
+      return true;
+    };
+    const cx = (bx0 + bx1) / 2 - wx0, cy = (by0 + by1) / 2 - wy0;
+    const cands = [];
+    for (let y = 2; y < wh - 2; y += 2)
+      for (let x = 2; x < ww - 2; x += 2) if (solid(x, y)) cands.push([(x - cx) ** 2 + (y - cy) ** 2, y * ww + x]);
+    if (!cands.length) return say("附近没有白底"), null;
+    cands.sort((p, q) => p[0] - q[0]);
+    // 从离框中心最近的白点开始，把连在一起的白色铺满。优先用"封闭"的一块（对话框里面，不碰窗口边）
+    const fill = (seed) => {
+      const reg = new Uint8Array(ww * wh);
+      const stack = [seed];
+      reg[seed] = 1;
+      let area = 0, touches = false, edgeTop = false, edgeBottom = false, rx0 = ww, ry0 = wh, rx1 = 0, ry1 = 0;
+      while (stack.length) {
+        const p = stack.pop();
+        area++;
+        const x = p % ww, y = (p / ww) | 0;
+        if (x < rx0) rx0 = x; if (x > rx1) rx1 = x; if (y < ry0) ry0 = y; if (y > ry1) ry1 = y;
+        if (x === 0 || y === 0 || x === ww - 1 || y === wh - 1) touches = true;
+        if (y === 0 && wy0 === 0) edgeTop = true; // 碰到整张截图的上边
+        if (y === wh - 1 && wy1 === H) edgeBottom = true;
+        if (x > 0 && !reg[p - 1] && light(x - 1, y)) (reg[p - 1] = 1), stack.push(p - 1);
+        if (x < ww - 1 && !reg[p + 1] && light(x + 1, y)) (reg[p + 1] = 1), stack.push(p + 1);
+        if (y > 0 && !reg[p - ww] && light(x, y - 1)) (reg[p - ww] = 1), stack.push(p - ww);
+        if (y < wh - 1 && !reg[p + ww] && light(x, y + 1)) (reg[p + ww] = 1), stack.push(p + ww);
+      }
+      return { reg, area, touches, edgeTop, edgeBottom, rb: [ry0, rx0, ry1 + 1, rx1 + 1] };
+    };
+    let pick = null;
+    const tried = [];
+    for (const [d, seed] of cands) {
+      if (tried.some((t) => t.reg[seed])) continue;
+      if (tried.length >= 40 || d > e * e * 9) break;
+      const f = fill(seed);
+      tried.push(f);
+      if (!f.touches && f.area >= bw * bh * 0.25) { pick = f; break; }
+    }
+    if (!pick && !allowOpen) return null;
+    pick ||= tried[0];
+    if (!pick) return say("附近没有白底"), null;
+    const { reg: region, area, touches, rb, edgeTop, edgeBottom } = pick;
+    if (area < bw * bh * 0.15) return say(`白的太少 ${area}/${Math.round(bw * bh)}`), null; // 白的太少：不是白底上的字
+    // 3. 从窗口边上把不是白色的地方铺满（画、对话框的边线、外面）；剩下没铺到的非白点就是被白色包住的字
+    const outside = new Uint8Array(ww * wh);
+    const st = [];
+    for (let x = 0; x < ww; x++) for (const y of [0, wh - 1]) { const p = y * ww + x; if (!region[p] && !outside[p]) (outside[p] = 1), st.push(p); }
+    for (let y = 0; y < wh; y++) for (const x of [0, ww - 1]) { const p = y * ww + x; if (!region[p] && !outside[p]) (outside[p] = 1), st.push(p); }
+    while (st.length) {
+      const p = st.pop();
+      const x = p % ww, y = (p / ww) | 0;
+      for (const [q, ok] of [[p - 1, x > 0], [p + 1, x < ww - 1], [p - ww, y > 0], [p + ww, y < wh - 1]])
+        if (ok && !region[q] && !outside[q]) (outside[q] = 1), st.push(q);
+    }
+    // 白底一直连到窗口外（大片白底上的字，不是封闭的对话框）：只认模型框附近的字，免得把旁边别的句子也算进来
+    const lim = touches
+      ? { x0: bx0 - wx0 - bw * 0.15, x1: bx1 - wx0 + bw * 0.15, y0: by0 - wy0 - bh * 0.15, y1: by1 - wy0 + bh * 0.15 }
+      : { x0: 0, x1: ww, y0: 0, y1: wh };
+    // 字的像素：被白色包住、颜色够深（JPEG 在白底上留下的浅灰杂点不算）
+    const inkMask = new Uint8Array(ww * wh);
+    let ink = 0;
+    for (let y = 0; y < wh; y++)
+      for (let x = 0; x < ww; x++) {
+        const p = y * ww + x;
+        if (region[p] || outside[p]) continue;
+        if (x < lim.x0 || x > lim.x1 || y < lim.y0 || y > lim.y1) continue;
+        if (at(x, y) > INK) continue;
+        inkMask[p] = 1;
+        ink++;
+      }
+    // 把字分成一段一段：先找出每个笔画块，再把离得近的（同一行的字、上下相邻的行）连成一段。
+    // 两个连在一起的对话框（白色是通的）里的两段话离得远，会分成两段；只要和模型的框重叠的那段
+    const comps = [];
+    {
+      const seen = new Uint8Array(ww * wh);
+      const st2 = [];
+      for (let p0 = 0; p0 < inkMask.length; p0++) {
+        if (!inkMask[p0] || seen[p0]) continue;
+        let cx0 = ww, cy0 = wh, cx1 = -1, cy1 = -1, n = 0;
+        seen[p0] = 1;
+        st2.push(p0);
+        while (st2.length) {
+          const p = st2.pop();
+          n++;
+          const x = p % ww, y = (p / ww) | 0;
+          if (x < cx0) cx0 = x; if (x > cx1) cx1 = x; if (y < cy0) cy0 = y; if (y > cy1) cy1 = y;
+          for (let j = -1; j <= 1; j++)
+            for (let i = -1; i <= 1; i++) {
+              const nx = x + i, ny = y + j;
+              if (nx < 0 || ny < 0 || nx >= ww || ny >= wh) continue;
+              const q = ny * ww + nx;
+              if (inkMask[q] && !seen[q]) (seen[q] = 1), st2.push(q);
+            }
+        }
+        if (n >= 3) comps.push([cx0, cy0, cx1, cy1]);
+        if (comps.length > 3000) break;
+      }
+    }
+    const hs = comps.map((c) => c[3] - c[1] + 1).filter((h) => h >= 3).sort((a, b) => a - b);
+    const glyph = hs.length ? Math.max(4, hs[Math.floor(hs.length * 0.7)]) : 8;
+    const parent = comps.map((_, i) => i);
+    const root = (i) => (parent[i] === i ? i : (parent[i] = root(parent[i])));
+    for (let i = 0; i < comps.length; i++)
+      for (let j = i + 1; j < comps.length; j++) {
+        const A = comps[i], B = comps[j];
+        const gx = Math.max(0, Math.max(A[0], B[0]) - Math.min(A[2], B[2]));
+        const gy = Math.max(0, Math.max(A[1], B[1]) - Math.min(A[3], B[3]));
+        if (gx <= glyph * 1.2 && gy <= glyph * 0.9) parent[root(i)] = root(j);
+      }
+    const groups = new Map();
+    comps.forEach((c, i) => {
+      const r = root(i);
+      const g = groups.get(r);
+      if (!g) groups.set(r, c.slice());
+      else (g[0] = Math.min(g[0], c[0])), (g[1] = Math.min(g[1], c[1])), (g[2] = Math.max(g[2], c[2])), (g[3] = Math.max(g[3], c[3]));
+    });
+    const mbx0 = bx0 - wx0, mbx1 = bx1 - wx0, mby0 = by0 - wy0, mby1 = by1 - wy0;
+    const blocks = [...groups.values()];
+    let picked = blocks.filter((g) => g[2] >= mbx0 && g[0] <= mbx1 && g[3] >= mby0 && g[1] <= mby1);
+    if (!picked.length && blocks.length) {
+      const d = (g) => Math.hypot((g[0] + g[2]) / 2 - (mbx0 + mbx1) / 2, (g[1] + g[3]) / 2 - (mby0 + mby1) / 2);
+      picked = [blocks.reduce((m, g) => (d(g) < d(m) ? g : m))];
+    }
+    let tx0 = Infinity, ty0 = Infinity, tx1 = -1, ty1 = -1;
+    for (const g of picked) {
+      if (g[0] < tx0) tx0 = g[0]; if (g[1] < ty0) ty0 = g[1]; if (g[2] > tx1) tx1 = g[2]; if (g[3] > ty1) ty1 = g[3];
+    }
+    if (ink < 8 || tx1 < tx0) {
+      // 对话框被截图的上下边切开了，框附近看不到字：告诉调用的地方"被切开"，这次先不画，等整个露出来再翻
+      if (edgeBottom || edgeTop) return say("对话框被截图边缘切开"), { cut: edgeBottom ? "bottom" : "top" };
+      return say(`没找到字 ink=${ink} touches=${touches}`), null;
+    }
+    // 字和模型的框差太远（比如找到的是别的对话框）就不信
+    const rw = tx1 - tx0 + 1, rh = ty1 - ty0 + 1;
+    if (rw * rh < bw * bh * 0.04 || rw * rh > bw * bh * 6) return say(`大小差太多 ${rw}×${rh} vs ${Math.round(bw)}×${Math.round(bh)}`), null;
+    const pad = 2;
+    // 模型的框贴着字、大部分在这个对话框里（位置本来就准，Claude 通常这样）：和找到的字合在一起用。
+    // 字贴着对话框边线时（比如两头的括号），那几个字会被当成边线、找不全，模型的框能补上。
+    // 模型的框比字大很多（千问常把整个对话框当成一个框，圆对话框四个角外面就是人脸）或者偏了：只用找到的字
+    const textArea = (tx1 - tx0 + 1) * (ty1 - ty0 + 1);
+    // 找到的字离模型的框太远：多半跳到了旁边另一个对话框上，不信
+    const dcx = (tx0 + tx1) / 2 - ((bx0 + bx1) / 2 - wx0), dcy = (ty0 + ty1) / 2 - ((by0 + by1) / 2 - wy0);
+    if (Math.hypot(dcx, dcy) > Math.max(bw, bh) * 0.9 + 20) return say("找到的字离模型的框太远"), null;
+    // 模型的框和找到的字重合得多（框本来就准）才合在一起用；偏了一半的框只用找到的字
+    const ox = Math.min(bx1 - wx0, tx1 + 1) - Math.max(bx0 - wx0, tx0);
+    const oy = Math.min(by1 - wy0, ty1 + 1) - Math.max(by0 - wy0, ty0);
+    const agree = ox > 0 && oy > 0 && (ox * oy) / (bw * bh) >= 0.5;
+    if (agree && bw * bh <= textArea * 2.5) {
+      // 封闭的对话框：只取模型的框落在对话框里的部分；白底连成一片时：用模型的框本身
+      const lim2 = touches ? [0, 0, wh, ww] : rb;
+      const ix0 = Math.max(bx0 - wx0, lim2[1]), ix1 = Math.min(bx1 - wx0, lim2[3]);
+      const iy0 = Math.max(by0 - wy0, lim2[0]), iy1 = Math.min(by1 - wy0, lim2[2]);
+      if (ix1 > ix0 && iy1 > iy0 && (ix1 - ix0) * (iy1 - iy0) >= bw * bh * 0.7) {
+        tx0 = Math.min(tx0, ix0); tx1 = Math.max(tx1, ix1 - 1);
+        ty0 = Math.min(ty0, iy0); ty1 = Math.max(ty1, iy1 - 1);
+      }
+    }
+    const gx = (x) => Math.round(((wx0 + x) / W) * 1000);
+    const gy = (y) => Math.round(((wy0 + y) / H) * 1000);
+    return {
+      box: [gy(ty0 - pad), gx(tx0 - pad), gy(ty1 + 1 + pad), gx(tx1 + 1 + pad)],
+      // 封闭的对话框本身的范围：同一个对话框里拆开的几行，靠它认出是一家
+      bubble: touches ? null : [gy(rb[0]), gx(rb[1]), gy(rb[2]), gx(rb[3])],
+    };
   }
 }
 
@@ -697,10 +938,14 @@ async function stripOnce(tab, g, auto, conf, opts = {}) {
   const bandH = (band1 - band0) / g.vh;
   // 条漫的格子横跨整个宽度，不左右切；只在很高的一段上下切
   // 一段比较高就上下切成两块同时发：每块要找的框少一半，回得快（交界多重叠一些，免得切断对话框）
-  // 预翻译时不切：几屏本来就同时在翻，切了请求数翻倍，更容易撞上限速
   const masks = covers.map((m) => ({ x0: m.left / g.vw, x1: m.right / g.vw, y0: m.top / g.vh, y1: m.bottom / g.vh }));
-  const pieces = await splitScreenshot(dataUrl, { cols: false, rows: !opts.prefetch && allowSplit && bandH * g.vh > 480, overlapY: 0.15, masks }, limits, region);
+  // 预翻译时不切：一段一张图发过去（试过千问也切成两块，请求翻倍、更慢，切线附近的框反而更乱）
+  const splitRows = allowSplit && bandH * g.vh > 480 && !opts.prefetch;
+  const pieces = await splitScreenshot(dataUrl, { cols: false, rows: splitRows, overlapY: 0.25, masks }, limits, region);
   const shade = await shader(dataUrl);
+  const refine = await makeRefiner(dataUrl).catch((e) => (console.warn("[校正] 出错，这一段不校正：", e), null));
+  let fixedN = 0, rawN = 0;
+  const mineItems = []; // 这一段这次画的框：同一个对话框被拆成几行时合并成一个
   const toC = (y) => (y / 1000) * g.vh - g.rect.top + g.scrollTop;
   const bh = band1 - band0;
   const EDGE = Math.max(6, bh * 0.015);
@@ -724,11 +969,42 @@ async function stripOnce(tab, g, auto, conf, opts = {}) {
           if (s.strip !== strip) return; // 翻的时候换了一话
           const item = piece.toGlobal(raw);
           if (!item) return;
+          const rawBox = item.box_2d.slice();
+          let fixed = null;
+          try {
+            fixed = refine?.(item.box_2d) || null;
+          } catch (e) {
+            console.warn("[校正] 出错：", e);
+          }
+          if (fixed?.box) fixedN++;
+          else if (!fixed) rawN++;
+          if (fixed?.cut) {
+            const k0 = toC(item.box_2d[0]), k1 = toC(item.box_2d[2]);
+            console.debug(`[条漫] 丢掉 ${Math.round(k0)}–${Math.round(k1)}（段 ${Math.round(band0)}–${Math.round(band1)}）：对话框被截图${fixed.cut === "bottom" ? "下" : "上"}边切开`);
+            if (fixed.cut === "bottom" && !atBottom) hi = Math.min(hi, k0);
+            else if (fixed.cut === "top" && !atTop) lo = Math.max(lo, k1);
+            else fixed = null;
+            if (fixed) return;
+          }
+          // 模型给的位置离得远、校正后却对到了同一段字上：多半是校正跑偏了
+          // （爆炸框、锯齿框边上是开口的，白色连到外面，找到的是旁边对话框的字），这条就用模型原来的框，免得被当成同一个对话框接到别人后面
+          if (fixed?.box) {
+            const fb = [toC(fixed.box[0]), fixed.box[1], toC(fixed.box[2]), fixed.box[3]];
+            const rb = [toC(rawBox[0]), rawBox[1], toC(rawBox[2]), rawBox[3]];
+            const stolen = mineItems.find((m) => m.refined && overlaps(m.cbox, fb) && !rawNear(m.rawC, rb));
+            if (stolen) {
+              console.debug(`[校正] 校正后和别的对话框对到同一段字，但模型给的位置离得远，用原来的框：${Math.round(rb[0])}–${Math.round(rb[2])}`);
+              fixed = null;
+              fixedN--;
+              rawN++;
+            }
+          }
+          if (fixed) item.box_2d = fixed.box;
           const c0 = toC(item.box_2d[0]);
           const c1 = toC(item.box_2d[2]);
           // 贴着截图上下边缘的框多半被切掉了一半：先不画，这一段也不算翻过，等它整个露出来再翻
           const tall = c1 - c0 > bh * 0.6;
-          const why = (r) => console.debug(`[条漫] 丢掉 ${Math.round(c0)}–${Math.round(c1)}（段 ${Math.round(band0)}–${Math.round(band1)}）：${r}`);
+          const why = (r) => console.debug(`[条漫] 丢掉 ${Math.round(c0)}–${Math.round(c1)}（段 ${Math.round(band0)}–${Math.round(band1)}）：${r}「${item.translation.slice(0, 20)}」`);
           if (!tall && !atTop && c0 - band0 < EDGE) return void ((lo = Math.max(lo, c1)), why("贴着上边"));
           if (!tall && !atBottom && band1 - c1 < EDGE) return void ((hi = Math.min(hi, c0)), why("贴着下边"));
           const cover = underCover(item.box_2d);
@@ -738,18 +1014,77 @@ async function stripOnce(tab, g, auto, conf, opts = {}) {
           cbox.id = `b${++boxSeq}`;
           // 和已经画过的框是同一处：新的明显更完整（比如上次只看到半个对话框）就换掉旧的，否则丢掉新的
           const area = (b) => (b[2] - b[0]) * (b[3] - b[1]);
+          // 同一次回答里落在同一处（同一个对话框被拆成几行，校正后都对到了整段字上）：把译文接到那个框后面
+          // 只合并同一块图的同一次回答：上下两块重叠处的同一个对话框，两边各翻一遍，那是重复，不是拆行
+          const toCB = (b) => b && [toC(b[0]), b[1], toC(b[2]), b[3]];
+          const me = { rawC: toCB(rawBox), bub: toCB(fixed?.bubble), refined: !!fixed };
+          const centerIn = (b, r) => r && (b[0] + b[2]) / 2 > r[0] && (b[0] + b[2]) / 2 < r[2] && (b[1] + b[3]) / 2 > r[1] && (b[1] + b[3]) / 2 < r[3];
+          // 只在确认是同一个封闭对话框时才合并（至少一边校正成功、找到了对话框的边）；
+          // 都没校正成功时，模型的大框互相重叠不能说明什么，合并会把两个对话框的话接在一起
+          // 只在两条对到的是同一段字时才合并：都校正过且对到同一段字，或者没校正的那条正好落在另一条找到的那段字上
+          const grow = (b, k) => { const h = (b[2] - b[0]) * k, w = (b[3] - b[1]) * k; return [b[0] - h, b[1] - w, b[2] + h, b[3] + w]; };
+          const sameBubble = (m) =>
+            m.piece === piece &&
+            rawNear(m.rawC, me.rawC) &&
+            ((m.refined && me.refined && touch(m.cbox, cbox)) ||
+              (m.refined && !me.refined && centerIn(me.rawC, grow(m.cbox, 0.2))) ||
+              (me.refined && !m.refined && centerIn(m.rawC, grow(cbox, 0.2))));
+          const sib = mineItems.find(sameBubble);
+          if (sib) {
+            const t = item.translation.trim();
+            if (sib.item.translation.includes(t)) return void why("同一个对话框里重复的句子");
+            // 模型有时同时给"整段一个框"和"每行一个框"，内容是重复的：
+            // 新的这条整个落在已有的大框里 → 是其中一行，丢掉；新的反过来把已有的整个包住 → 新的是整段，用它的译文
+            const inside = (a, b) => {
+              const w = Math.min(a[3], b[3]) - Math.max(a[1], b[1]);
+              const h = Math.min(a[2], b[2]) - Math.max(a[0], b[0]);
+              return w > 0 && h > 0 && (w * h) / area(a) > 0.8;
+            };
+            if (inside(me.rawC, sib.rawC) && area(sib.rawC) > area(me.rawC) * 1.8) return void why("是已有整段里的一行");
+            if (inside(sib.rawC, me.rawC) && area(me.rawC) > area(sib.rawC) * 1.8) {
+              sib.item.translation = t;
+              sib.rawC = me.rawC;
+              why("整段的译文换掉之前的一行");
+              send(tab.id, { type: "stripAdd", item: sib.item, replace: sib.item.id, anchor: { scrollTop: g.scrollTop, top: g.rect.top, left: g.rect.left } });
+              return;
+            }
+            sib.item.translation += (CJK_RE.test(t) ? "" : " ") + t;
+            // 框用校正过的那个；都校正过（或都没校正）就用大的
+            if (me.refined && sib.refined) {
+              // 都对准了字（同一个对话框里的几行）：框合成一个，把几行都包住
+              const u = (a, b) => [Math.min(a[0], b[0]), Math.min(a[1], b[1]), Math.max(a[2], b[2]), Math.max(a[3], b[3])];
+              sib.item.box_2d = u(sib.item.box_2d, item.box_2d);
+              sib.cbox.splice(0, 4, ...u(sib.cbox, cbox));
+            } else if ((me.refined && !sib.refined) || (me.refined === sib.refined && area(cbox) > area(sib.cbox))) {
+              sib.item.box_2d = item.box_2d;
+              sib.cbox.splice(0, 4, ...cbox);
+              sib.refined ||= me.refined;
+              sib.bub ||= me.bub;
+              sib.cbox.refined = sib.refined;
+            }
+            why("和同一个对话框里的上一行合并");
+            send(tab.id, { type: "stripAdd", item: sib.item, replace: sib.item.id, anchor: { scrollTop: g.scrollTop, top: g.rect.top, left: g.rect.left } });
+            return;
+          }
+          // 和已经画过的框是同一处：校正过的（对准了字）优先于没校正的（模型原来的大框）；
+          // 都校正过或都没校正，新的明显更大（比如上次只看到半个对话框）才换
+          cbox.refined = me.refined;
           const old = strip.items.find((b) => overlaps(b, cbox));
-          if (old && area(cbox) <= area(old) * 1.25) return void why("重复");
-          if (old) strip.items.splice(strip.items.indexOf(old), 1), why("比之前画的完整，换掉旧的");
+          const better = old && ((cbox.refined && !old.refined) || (cbox.refined === !!old.refined && area(cbox) > area(old) * 1.25));
+          if (old && !better) return void why(`重复（和已画的 ${Math.round(old[0])}–${Math.round(old[2])} 那个）`);
+          if (old) strip.items.splice(strip.items.indexOf(old), 1), why(cbox.refined && !old.refined ? "校正过的换掉没校正的大框" : "比之前画的完整，换掉旧的");
           strip.items.push(cbox);
           item.id = cbox.id;
           item.dark = shade(item.box_2d);
           count++;
+          mineItems.push({ cbox, item, piece, ...me });
+          console.debug(`[条漫] 画 ${Math.round(c0)}–${Math.round(c1)}${fixed ? "（校正过）" : ""}「${item.translation.slice(0, 20)}」`);
           send(tab.id, { type: "stripAdd", item, replace: old?.id, anchor: { scrollTop: g.scrollTop, top: g.rect.top, left: g.rect.left } });
         },
       })
     )
   );
+  console.debug(`[校正] 段 ${Math.round(band0)}–${Math.round(band1)}：模型给了 ${fixedN + rawN} 个框，校正了 ${fixedN} 个，用原来的 ${rawN} 个`);
   console.debug(
     `[条漫] ${Math.round(band1 - band0)}px 分 ${pieces.length} 块：截图 ${((captured - t0) / 1000).toFixed(1)} 秒，` +
       `翻译 ${((Date.now() - started) / 1000).toFixed(1)} 秒，${count} 个框`
@@ -768,7 +1103,26 @@ async function stripOnce(tab, g, auto, conf, opts = {}) {
   }
 }
 
+const CJK_RE = /[\u3040-\u30ff\u3400-\u9fff]/;
+
+
 // 交叠部分占较小那个框的六成以上，就算是同一段文字
+// 模型给的两个原始框是不是同一个对话框里上下相邻的几行：左右有重叠，上下的空隙不超过矮的那个框高度的八成。
+// （同一个对话框拆成几行时，行和行之间只隔一点点；两个不同的对话框之间隔得远）
+// 框的格式是 [y0（像素）, x0（0–1000）, y1（像素）, x1（0–1000）]
+function rawNear(a, b) {
+  if (!a || !b) return true;
+  const xo = Math.min(a[3], b[3]) - Math.max(a[1], b[1]);
+  const gapY = Math.max(a[0], b[0]) - Math.min(a[2], b[2]);
+  const minH = Math.min(a[2] - a[0], b[2] - b[0]);
+  return xo > -20 && gapY <= Math.max(minH * 0.8, 6);
+}
+
+// 两个框有交叠（多少都算）
+function touch(a, b) {
+  return Math.min(a[3], b[3]) > Math.max(a[1], b[1]) && Math.min(a[2], b[2]) > Math.max(a[0], b[0]);
+}
+
 function overlaps([ay0, ax0, ay1, ax1], [by0, bx0, by1, bx1]) {
   const w = Math.min(ax1, bx1) - Math.max(ax0, bx0);
   const h = Math.min(ay1, by1) - Math.max(ay0, by0);

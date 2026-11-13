@@ -73,6 +73,10 @@ const STRINGS = {
     "阿里云账户欠费或免费额度已用完，请到百炼控制台查看。",
     "Your Alibaba Cloud account is out of free quota or has an unpaid balance. Check the Model Studio console.",
   ],
+  qwenAccessDenied: [
+    "通义千问拒绝使用这个模型：多半是 qwen3-vl-plus 的免费额度用完了（开着“免费额度用完即停”时会这样）。到百炼控制台 → 模型 → qwen3-vl-plus 查看剩余额度；要继续用就充值并关掉“免费额度用完即停”，或者在设置里换成 Claude。",
+    "Qwen refused access to the model, most likely because the qwen3-vl-plus free quota ran out while “stop when free quota runs out” is on. Check the quota in Model Studio → Models → qwen3-vl-plus; top up and switch that option off to keep going, or switch to Claude in Options.",
+  ],
   qwenInspection: ["通义千问认为这张图里有敏感内容，拒绝处理。", "Qwen flagged this image as sensitive and wouldn't process it."],
   claudeNoPermission: ["这个 Claude key 没有权限使用该模型。", "This Claude key doesn't have access to that model."],
   claudeRateLimit: [

@@ -320,8 +320,11 @@ if (!window.__manhwaTranslatorReady) {
 
   // 截图前藏起这一段的译文和提示，截完再显示
   let hidden = [];
+  // 正在截图（hide 和 show 之间）：这时候新画上的译文框也先藏着，不然会被截进去，被当成漫画里的对话框
+  let hiding = false;
   // hideUi：按钮、提示挡住漫画时也藏起来（平常边看边翻用；预翻译时不藏，免得闪）
   function hide(y0, y1, hideUi) {
+    hiding = true;
     const layer = ensureHost().getElementById("layer");
     hidden = [...layer.querySelectorAll(".box"), ...(strip?.track.children || [])].filter((el) => {
       const r = el.getBoundingClientRect();
@@ -344,6 +347,7 @@ if (!window.__manhwaTranslatorReady) {
     });
   }
   function show() {
+    hiding = false;
     hidden.forEach((el) => el.classList.remove("hidden"));
     hidden = [];
   }
@@ -574,6 +578,10 @@ if (!window.__manhwaTranslatorReady) {
       // 换掉之前画的不完整的框
       if (msg.replace) strip.track.querySelector(`[data-id="${msg.replace}"]`)?.remove();
       addBox(msg.item, msg.anchor);
+      if (hiding && msg.item.id) {
+        const el = strip.track.querySelector(`[data-id="${msg.item.id}"]`);
+        if (el) el.classList.add("hidden"), hidden.push(el);
+      }
     } else if (msg.type === "stripDone") {
       stripRuns = Math.max(0, stripRuns - 1);
       if (stripRuns) return;

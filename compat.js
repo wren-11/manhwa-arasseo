@@ -26,6 +26,8 @@ export const PROVIDERS = {
     errors: {
       Arrearage: "qwenArrearage", // i18n.js 里的文字
       DataInspectionFailed: "qwenInspection",
+      AccessDenied: "qwenAccessDenied",
+      "Model.AccessDenied": "qwenAccessDenied",
     },
   },
   openai: {
@@ -91,6 +93,8 @@ async function request(cfg, path, apiKey, init = {}) {
   const msg = data.error?.message || res.statusText;
   const code = data.error?.code;
   let text = cfg.errors[code] && t(cfg.errors[code]);
+  // 千问免费额度用完、又开着"免费额度用完即停"时返回 403 Access to model denied
+  if (!text && res.status === 403 && /access to model denied/i.test(msg) && cfg.errors.AccessDenied) text = t(cfg.errors.AccessDenied);
   if (!text) {
     if (res.status === 401) text = cfg.keyInvalid ? t(cfg.keyInvalid) : t("keyInvalid", { name: cfg.name });
     else if (res.status === 429) text = t("rateLimit", { name: cfg.name });
@@ -99,6 +103,7 @@ async function request(cfg, path, apiKey, init = {}) {
   }
   const err = new Error(text);
   err.status = res.status;
+  err.code = code;
   err.detail = msg;
   throw err;
 }
