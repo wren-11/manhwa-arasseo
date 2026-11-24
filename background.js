@@ -84,8 +84,8 @@ async function run(tab, { auto = false, prefetch = false } = {}) {
     claudeModel: savedClaudeModel,
     lang = "zh-Hans",
   } = await chrome.storage.local.get(["provider", "apiKey", "model", "claudeKey", "claudeModel", "lang"]);
-  // 设置页现在只有通义千问和 Claude；以前存的 Gemini（代码还留着，以后可以加回来）也按设置页显示的默认值走
-  const provider = savedProvider === "claude" || savedProvider === "qwen" ? savedProvider : "qwen";
+  // 设置页现在有通义千问、Claude 和 OpenAI；以前存的 Gemini（代码还留着，以后可以加回来）也按设置页显示的默认值走
+  const provider = ["claude", "qwen", "openai"].includes(savedProvider) ? savedProvider : "qwen";
   const claudeModel = CLAUDE_MODELS.some((m) => m.name === savedClaudeModel) ? savedClaudeModel : CLAUDE_DEFAULT_MODEL;
   const isClaude = provider === "claude";
   // 兼容接口的服务商（通义千问等）的 key 和模型存成 qwenKey / qwenModel 这样
@@ -980,6 +980,17 @@ async function stripOnce(tab, g, auto, conf, opts = {}) {
           else if (!fixed) rawN++;
           if (fixed?.cut) {
             const k0 = toC(item.box_2d[0]), k1 = toC(item.box_2d[2]);
+            // 模型给的框离那条边还有距离：模型看到的是整段字，没被切开。
+            // 校正说"切开"只是因为在白色里找不到字（白色描边的大字连着浅色背景时会这样），就用模型原来的框
+            const away = fixed.cut === "bottom" ? band1 - k1 : k0 - band0;
+            if (away > EDGE) {
+              console.debug(`[校正] 说对话框被${fixed.cut === "bottom" ? "下" : "上"}边切开，但模型的框 ${Math.round(k0)}–${Math.round(k1)} 离边还有 ${Math.round(away)}px，用模型的框`);
+              fixed = null;
+              rawN++;
+            }
+          }
+          if (fixed?.cut) {
+            const k0 = toC(item.box_2d[0]), k1 = toC(item.box_2d[2]);
             console.debug(`[条漫] 丢掉 ${Math.round(k0)}–${Math.round(k1)}（段 ${Math.round(band0)}–${Math.round(band1)}）：对话框被截图${fixed.cut === "bottom" ? "下" : "上"}边切开`);
             if (fixed.cut === "bottom" && !atBottom) hi = Math.min(hi, k0);
             else if (fixed.cut === "top" && !atTop) lo = Math.max(lo, k1);
@@ -1066,6 +1077,45 @@ async function stripOnce(tab, g, auto, conf, opts = {}) {
             send(tab.id, { type: "stripAdd", item: sib.item, replace: sib.item.id, anchor: { scrollTop: g.scrollTop, top: g.rect.top, left: g.rect.left } });
             return;
           }
+          // GPT 爱把一段字（拟声词、竖排字、大字）拆成几小块，框叠在一起但不到"重叠"的标准，画出来是一摞。
+          // 同一次回答里、都没对到对话框上的两个框，只要叠到一点就合成一个：译文一样就只留一个，不一样就按阅读顺序接起来
+          if (conf.provider === "openai" && !me.refined) {
+            const inter = (a, b) => Math.max(0, Math.min(a[2], b[2]) - Math.max(a[0], b[0])) * Math.max(0, Math.min(a[3], b[3]) - Math.max(a[1], b[1]));
+            const ar = (b) => (b[2] - b[0]) * (b[3] - b[1]);
+            const frag = mineItems.find((m) => m.piece === piece && !m.refined && inter(m.cbox, cbox) > Math.min(ar(m.cbox), ar(cbox)) * 0.1);
+            if (frag) {
+              const t = item.translation.trim();
+              const ft = frag.item.translation.trim();
+              if (normSrc(ft) === normSrc(t) || ft.includes(t)) return void why("和叠在一起的 GPT 框是同一句");
+              const before = c0 < frag.cbox[0] - 4 || (Math.abs(c0 - frag.cbox[0]) <= 4 && item.box_2d[1] < frag.cbox[1]);
+              const sep = CJK_RE.test(t) && CJK_RE.test(ft) ? "" : " ";
+              frag.item.translation = t.includes(ft) ? t : before ? t + sep + ft : ft + sep + t;
+              const u = (a, b) => [Math.min(a[0], b[0]), Math.min(a[1], b[1]), Math.max(a[2], b[2]), Math.max(a[3], b[3])];
+              frag.item.box_2d = u(frag.item.box_2d, item.box_2d);
+              frag.cbox.splice(0, 4, ...u(frag.cbox, cbox));
+              frag.rawC = u(frag.rawC, me.rawC);
+              why("和叠在一起的 GPT 框合成一个");
+              send(tab.id, { type: "stripAdd", item: frag.item, replace: frag.item.id, anchor: { scrollTop: g.scrollTop, top: g.rect.top, left: g.rect.left } });
+              return;
+            }
+          }
+          // 上下两块重叠处的同一句：两块各翻一遍，位置常常一个准一个偏，框不重叠就认不出来。
+          // 按模型抄下的原文认：别的块里离得不远、原文一样的，只留一个（校正过的优先）
+          const key = normSrc(item.src);
+          const twin = key.length >= 2 && mineItems.find((m) => m.piece !== piece && m.key && (m.key === key || (Math.min(m.key.length, key.length) >= 4 && (m.key.includes(key) || key.includes(m.key)))) && Math.abs((m.cbox[0] + m.cbox[2]) / 2 - (c0 + c1) / 2) < bh * 0.5);
+          if (twin) {
+            if (!(me.refined && !twin.refined)) return void why(`另一块已经翻过同一句「${item.src.slice(0, 12)}」`);
+            strip.items.splice(strip.items.indexOf(twin.cbox), 1);
+            mineItems.splice(mineItems.indexOf(twin), 1);
+            why(`同一句另一块的位置没校正，换成这个「${item.src.slice(0, 12)}」`);
+            cbox.refined = true;
+            strip.items.push(cbox);
+            item.id = cbox.id;
+            item.dark = shade(item.box_2d);
+            mineItems.push({ cbox, item, piece, key, ...me });
+            send(tab.id, { type: "stripAdd", item, replace: twin.item.id, anchor: { scrollTop: g.scrollTop, top: g.rect.top, left: g.rect.left } });
+            return;
+          }
           // 和已经画过的框是同一处：校正过的（对准了字）优先于没校正的（模型原来的大框）；
           // 都校正过或都没校正，新的明显更大（比如上次只看到半个对话框）才换
           cbox.refined = me.refined;
@@ -1077,7 +1127,7 @@ async function stripOnce(tab, g, auto, conf, opts = {}) {
           item.id = cbox.id;
           item.dark = shade(item.box_2d);
           count++;
-          mineItems.push({ cbox, item, piece, ...me });
+          mineItems.push({ cbox, item, piece, key, ...me });
           console.debug(`[条漫] 画 ${Math.round(c0)}–${Math.round(c1)}${fixed ? "（校正过）" : ""}「${item.translation.slice(0, 20)}」`);
           send(tab.id, { type: "stripAdd", item, replace: old?.id, anchor: { scrollTop: g.scrollTop, top: g.rect.top, left: g.rect.left } });
         },
@@ -1371,8 +1421,9 @@ async function splitScreenshot(dataUrl, split, limits, R = FULL) {
   );
 }
 
-async function encode(bmp, sx, sw, sy, sh, { maxSide = MAX_SIDE, maxPixels = Infinity, quality = 0.85 } = {}) {
-  const scale = Math.min(1, maxSide / Math.max(sw, sh), Math.sqrt(maxPixels / (sw * sh)));
+// shortSide：短边最多多少像素（OpenAI 会在内部把短边缩到 768，先缩好，坐标才对得上）
+async function encode(bmp, sx, sw, sy, sh, { maxSide = MAX_SIDE, maxPixels = Infinity, shortSide = Infinity, quality = 0.85 } = {}) {
+  const scale = Math.min(1, maxSide / Math.max(sw, sh), shortSide / Math.min(sw, sh), Math.sqrt(maxPixels / (sw * sh)));
   const w = Math.round(sw * scale);
   const h = Math.round(sh * scale);
   const canvas = new OffscreenCanvas(w, h);
@@ -1384,6 +1435,9 @@ async function encode(bmp, sx, sw, sy, sh, { maxSide = MAX_SIDE, maxPixels = Inf
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// 比较两块里抄下的原文是不是同一句：去掉空格和标点（模型抄的时候标点、省略号常常不一样）
+const normSrc = (s) => (s || "").replace(/[\s\p{P}\p{S}]/gu, "");
 const isBusy = (e) => e.status === 500 || e.status === 503;
 
 async function translateWithFallback(tabId, opts) {

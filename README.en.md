@@ -24,6 +24,7 @@ Pick one:
 
 - **Qwen** (Alibaba Cloud): cheap, with a free quota in some regions.
 - **Claude**: the best results, pay as you go.
+- **OpenAI** (ChatGPT): uses gpt-5, pay as you go.
 
 ### Qwen
 
@@ -44,6 +45,15 @@ If you use a free quota, open `qwen3-vl-plus` under Models and switch on "免费
 1. Sign in to [platform.claude.com](https://platform.claude.com) and add credit under Billing. On Claude Max or Team, you can use your monthly API credit instead by linking it under Settings → Billing → API credits on claude.ai.
 2. Create a key under API Keys and copy it.
 3. Right-click the extension icon → **Options**, choose Claude, paste the key and save.
+
+### OpenAI (ChatGPT)
+
+1. Sign in to [platform.openai.com](https://platform.openai.com) and add credit under Settings → Billing (minimum $5). The API is billed separately from ChatGPT subscriptions, so you need to add credit even if you pay for Plus.
+2. Under Settings → Organization, click **Verify Organization** and complete identity verification. gpt-5 won't work without it, and it can take up to 15 minutes to take effect.
+3. Create a key under API keys and copy it.
+4. Right-click the extension icon → **Options**, choose OpenAI, paste the key and save.
+
+Only OpenAI's official endpoint is supported, not third-party proxies.
 
 Your key stays in your browser. Don't share it.
 

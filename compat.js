@@ -9,6 +9,8 @@ export const PROVIDERS = {
     },
     // 旧的通用域名，2026-09-30 起只维护不加新功能；用户可以在设置里填业务空间专属地址覆盖
     base: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    // 设置里的 Base URL 只能填阿里云百炼的地址（和 manifest 的 host_permissions 对应），不能借这一栏接别家的接口
+    hosts: [/^dashscope\.aliyuncs\.com$/, /^dashscope-intl\.aliyuncs\.com$/, /^[\w-]+(\.[\w-]+)*\.maas\.aliyuncs\.com$/],
     // 北京区没有 qwen3-vl-flash（Model not exist），只留 Plus
     models: [{ name: "qwen3-vl-plus", label: "Qwen3-VL-Plus" }],
     split: true,
@@ -33,12 +35,30 @@ export const PROVIDERS = {
   openai: {
     name: "OpenAI",
     base: "https://api.openai.com/v1",
-    models: [{ name: "gpt-5-mini", label: "gpt-5-mini" }],
-    split: true,
+    // 只连官方地址，不接中转（中转慢，也没法确认后面跑的是什么模型）
+    hosts: [/^api\.openai\.com$/],
+    // gpt-5-mini 试过，框太不准，只留 gpt-5
+    models: [{ name: "gpt-5", label: "gpt-5" }],
+    // 不切块：切成上下两块时，重叠处同一句两块各翻一遍，GPT 两次抄的原文还不一样，去不掉重复
+    split: false,
     jsonMode: "json_schema",
-    extra: { reasoning_effort: "low" },
+    // GPT 给 0–1000 比例坐标会整体往左上缩（框对不准），像 Claude 一样要像素坐标
+    coords: "pixel",
+    // OpenAI 收到图会先缩到短边 768（长边不超过 2048）再看；先缩好再发，它看到的像素就是我们换算用的像素
+    image: { shortSide: 768, maxSide: 2048 },
+    detail: "high",
+    // GPT 爱把一段字按行、按词拆成好几条（大字、旁白最明显），也会跳过脏话
+    promptExtra:
+      "\n\n特别注意：同一个对话框、同一块旁白框、同一组大字，不管分成几行、字有多大，都只输出一条，框住整段文字（从第一行的第一个字到最后一行的最后一个字），不要按行或按词拆成几条。" +
+      "脏话、粗口也要照实翻译成对应语气的说法，不能跳过不翻。translation 里不能留任何韩文字（比如「아이씨」要翻成「靠…」「该死…」，不能写成「哎씨」）。",
+    stripHangul: true,
+    // 每次都把 GPT 的原话记进日志（详细级别），漏翻时能看出是它没给还是被插件丢了
+    logRaw: true,
+    // 推理模型：找框翻对白用不着多想，调到最低更快（不认这个值时 stream() 会去掉它重发）
+    extra: { reasoning_effort: "minimal" },
     errors: {
-      insufficient_quota: "OpenAI 账户余额不足。API 和 ChatGPT 会员是分开计费的，需要到 platform.openai.com 的 Billing 里充值。", // 设置页没有 OpenAI，没翻英文
+      insufficient_quota: "openaiQuota",
+      unverified: "openaiUnverified",
     },
   },
 };
@@ -83,6 +103,18 @@ const shape = (lang, transcribe) =>
     transcribe ? '"text":"나는 정말 행복했어.",' : ""
   }"translation":"${EXAMPLE[lang] || EXAMPLE["zh-Hans"]}"}]}`;
 
+// 设置里填的 Base URL 能不能用：空的就用默认地址；服务商没写 hosts 的不限制
+export function baseAllowed(provider, url) {
+  const hosts = PROVIDERS[provider]?.hosts;
+  if (!url || !hosts) return true;
+  try {
+    const u = new URL(url);
+    return u.protocol === "https:" && hosts.some((h) => h.test(u.hostname));
+  } catch {
+    return false;
+  }
+}
+
 async function request(cfg, path, apiKey, init = {}) {
   const res = await fetch(`${(cfg.baseOverride || cfg.base).replace(/\/+$/, "")}/${path}`, {
     ...init,
@@ -95,6 +127,8 @@ async function request(cfg, path, apiKey, init = {}) {
   let text = cfg.errors[code] && t(cfg.errors[code]);
   // 千问免费额度用完、又开着"免费额度用完即停"时返回 403 Access to model denied
   if (!text && res.status === 403 && /access to model denied/i.test(msg) && cfg.errors.AccessDenied) text = t(cfg.errors.AccessDenied);
+  // OpenAI 的新模型要先做组织验证，没做时返回 404 "Your organization must be verified..."，别说成"找不到模型"
+  if (!text && /organization must be verified/i.test(msg) && cfg.errors.unverified) text = t(cfg.errors.unverified);
   if (!text) {
     if (res.status === 401) text = cfg.keyInvalid ? t(cfg.keyInvalid) : t("keyInvalid", { name: cfg.name });
     else if (res.status === 429) text = t("rateLimit", { name: cfg.name });
@@ -148,23 +182,44 @@ export function looseScanner(onObject) {
   };
 }
 
-function toBox(it) {
-  if (![it.x1, it.y1, it.x2, it.y2].every(Number.isFinite)) return null;
-  const n = (v) => Math.round(Math.min(1000, Math.max(0, v)));
-  const [xa, xb] = [n(it.x1), n(it.x2)].sort((a, b) => a - b);
-  const [ya, yb] = [n(it.y1), n(it.y2)].sort((a, b) => a - b);
-  return { box_2d: [ya, xa, yb, xb], translation: it.translation };
+// GPT 偶尔在译文里留一两个韩文字（比如"아이씨"翻成"哎씨…"），整条会被当成没翻丢掉。
+// 译文里还有别的字时，只把韩文字去掉；整句都是韩文的照旧交给后面丢掉
+function stripHangul(t) {
+  if (!/[\uac00-\ud7a3]/.test(t)) return t;
+  const rest = t.replace(/[\uac00-\ud7a3]+/g, "").replace(/[ \t]{2,}/g, " ").trim();
+  return /[^\s\p{P}\p{S}\d]/u.test(rest) ? rest : t;
 }
 
-export async function translateCompat({ provider, baseUrl, apiKey, model, lang, imageBase64, onItem, signal }) {
+// size：像素坐标时传图片的 { width, height }，换算成 0–1000；不传就当已经是 0–1000
+function toBox(it, size) {
+  if (![it.x1, it.y1, it.x2, it.y2].every(Number.isFinite)) return null;
+  const sx = size ? 1000 / size.width : 1;
+  const sy = size ? 1000 / size.height : 1;
+  const nx = (v) => Math.round(Math.min(1000, Math.max(0, v * sx)));
+  const ny = (v) => Math.round(Math.min(1000, Math.max(0, v * sy)));
+  const [xa, xb] = [nx(it.x1), nx(it.x2)].sort((a, b) => a - b);
+  const [ya, yb] = [ny(it.y1), ny(it.y2)].sort((a, b) => a - b);
+  // src：模型抄下的韩文原文，上下两块重叠处翻到同一句时靠它认出来
+  return { box_2d: [ya, xa, yb, xb], translation: it.translation, ...(typeof it.text === "string" && { src: it.text }) };
+}
+
+export async function translateCompat({ provider, baseUrl, apiKey, model, lang, imageBase64, width, height, onItem, signal }) {
+  // 以前存下的非阿里云地址（比如别家的中转）直接报错，不把 key 发过去
+  if (!baseAllowed(provider, baseUrl)) throw new Error(t("baseUrlNotAllowed"));
   const cfg = { ...PROVIDERS[provider], baseOverride: baseUrl };
+  const pixel = cfg.coords === "pixel" && width > 0 && height > 0;
+  cfg.size = pixel ? { width, height } : null;
+  const boxSpec = pixel
+    ? `- x1, y1, x2, y2：这段原文在图片上的像素坐标（左上角和右下角）。图片宽 ${width} 像素、高 ${height} 像素，原点在左上角。框要紧贴文字本身，不要框住整个格子或大片空白。`
+    : BOX_SPEC;
   const transcribe = cfg.transcribe ?? true;
-  let prompt = buildPrompt(lang, BOX_SPEC + (transcribe ? TEXT_SPEC : "")).replace(
+  let prompt = buildPrompt(lang, boxSpec + (transcribe ? TEXT_SPEC : "")).replace(
     "没有文字就返回空数组",
     "没有文字就返回空的 items"
   );
   // 结构化输出也带上格式和例子："translation 必须是译文"这句能防止它照抄韩文
   prompt += shape(lang, transcribe);
+  if (cfg.promptExtra) prompt += cfg.promptExtra;
   const body = {
     model,
     stream: true,
@@ -178,7 +233,7 @@ export async function translateCompat({ provider, baseUrl, apiKey, model, lang, 
       {
         role: "user",
         content: [
-          { type: "image_url", image_url: { url: `data:image/jpeg;base64,${imageBase64}` } },
+          { type: "image_url", image_url: { url: `data:image/jpeg;base64,${imageBase64}`, ...(cfg.detail && { detail: cfg.detail }) } },
           { type: "text", text: prompt },
         ],
       },
@@ -228,7 +283,8 @@ async function stream(cfg, body, apiKey, signal, onItem) {
   let dropped = 0;
   let raw = "";
   const handle = (obj) => {
-    const it = toBox(obj);
+    const it = toBox(obj, cfg.size);
+    if (it && cfg.stripHangul) it.translation = stripHangul(it.translation);
     if (!valid(it)) return void dropped++;
     items.push(it);
     onItem?.(it);
@@ -288,7 +344,7 @@ async function stream(cfg, body, apiKey, signal, onItem) {
     stats.usage || ""
   );
   // 有被过滤的就把模型原话打出来（同样只在 Verbose 级别显示），看是没翻译、坐标不对还是格式不对
-  if (dropped || !items.length) console.debug(`[${cfg.name}] 可用 ${items.length} 条，被过滤 ${dropped} 条，原始输出：`, raw.slice(0, 3000));
+  if (dropped || !items.length || cfg.logRaw) console.debug(`[${cfg.name}] 可用 ${items.length} 条，被过滤 ${dropped} 条，原始输出：`, raw.slice(0, 3000));
   if (refusal && !items.length) throw new Error(t("refused", { name: cfg.name }));
   return items;
 }

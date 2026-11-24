@@ -20,10 +20,11 @@ Edge、Brave、Arc 等基于 Chrome 的浏览器用同样的方法安装，但�
 
 ## 获取 API key
 
-二选一：
+三选一：
 
 - **通义千问**：国内首选，北京地域新用户有 100 万 token 免费额度。
 - **Claude**：效果最好，按量付费。
+- **OpenAI（ChatGPT）**：用 gpt-5，按量付费。中国大陆需要代理才能连接。
 
 ### 通义千问
 
@@ -45,6 +46,15 @@ Edge、Brave、Arc 等基于 Chrome 的浏览器用同样的方法安装，但�
 1. 登录 [platform.claude.com](https://platform.claude.com)，在 Billing 里充值。Claude Max / Team 会员可以在 claude.ai 的 Settings → Billing → API credits 里绑定，使用每月赠送的额度。
 2. 在 API Keys 里创建 key 并复制。
 3. 右键插件图标 →“选项”，选 Claude，粘贴 key，保存。
+
+### OpenAI（ChatGPT）
+
+1. 登录 [platform.openai.com](https://platform.openai.com)，在 Settings → Billing 里充值（最少 $5）。API 和 ChatGPT 会员是分开计费的，开了 Plus 也要单独充值。
+2. 在 Settings → Organization 里点 **Verify Organization** 完成身份验证，不验证用不了 gpt-5。验证后最多要等 15 分钟生效。
+3. 在 API keys 里创建 key 并复制。
+4. 右键插件图标 →“选项”，选 OpenAI，粘贴 key，保存。
+
+只支持 OpenAI 官方地址，不支持第三方中转。
 
 key 只保存在你的浏览器里，不要发给别人。
 

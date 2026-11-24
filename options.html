@@ -27,6 +27,7 @@
     <select id="provider">
       <option value="qwen" data-i18n="qwenOption">通义千问（国内直连，新用户有免费额度）</option>
       <option value="claude">Claude（Anthropic）</option>
+      <option value="openai" data-i18n="openaiOption">OpenAI（ChatGPT）</option>
     </select>
   </label>
 
@@ -43,6 +44,18 @@
     <label><span data-i18n="baseUrl">Base URL（可选）</span>
       <input id="qwenBase" type="url" autocomplete="off" placeholder="https://ws-xxxx.cn-beijing.maas.aliyuncs.com/compatible-mode/v1">
       <div class="hint" data-i18n="baseUrlHint"></div>
+    </label>
+  </fieldset>
+
+  <fieldset id="openaiBox">
+    <legend>OpenAI</legend>
+    <label><span data-i18n="openaiKey">OpenAI API key</span>
+      <input id="openaiKey" type="password" autocomplete="off" placeholder="sk-…">
+      <div class="hint" data-i18n="openaiKeyHint"></div>
+    </label>
+    <label><span data-i18n="model">模型</span>
+      <select id="openaiModel"></select>
+      <div class="hint" data-i18n="openaiModelHint"></div>
     </label>
   </fieldset>
 
